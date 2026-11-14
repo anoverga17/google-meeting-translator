@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Meet Caption Capture",
+  "version": "0.1.0",
+  "description": "Streams Google Meet live captions to a local transcript server.",
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Meet Caption Capture"
+  },
+  "host_permissions": [
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*"
+  ]
+}
