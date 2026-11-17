@@ -16,9 +16,8 @@ any other agent (e.g. Claude Code) at `transcript.txt` instead of / alongside
 ## Setup
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...
+make install                         # creates .venv and installs requirements
+export ANTHROPIC_API_KEY=sk-ant-...  # not needed for `make cc`
 ```
 
 Load the extension in Chrome: `chrome://extensions` → enable **Developer mode** →
@@ -28,45 +27,59 @@ folder to a Windows path and load that.)
 
 ## Run
 
-Terminal 1 — transcript server:
-
 ```bash
-.venv/bin/python server.py                 # appends to ./transcript.txt
+make run     # transcript server + translator via the Claude API
+make cc      # same, but translate through Claude Code on your Claude plan
 ```
 
-Terminal 2 — translator:
-
-```bash
-.venv/bin/python translate.py              # streams English, appends to ./translation.txt
-.venv/bin/python translate.py --notes notes.txt   # names, project terms, glossary
-```
+Both start the transcript server in the background (logging to `server.log`;
+`tail -f server.log` to watch raw captions) and the translator in the foreground,
+which streams English and appends it to `translation.txt`. Ctrl+C stops both.
 
 Then join the Meet, turn on captions (CC) and set the caption language to
 Japanese. The extension badge shows **ON** when captions reach the server and
 **ERR** when the server isn't reachable (captions are buffered and retried).
 
-Useful `translate.py` options: `--model claude-haiku-5-5` (faster, cheaper),
-`--effort` (default `low` for latency), `--debounce` / `--max-wait` (how long to
-batch lines before translating), `--from-start` (translate what's already in the file).
+Options are make variables:
+
+```bash
+make run NOTES=notes.txt               # names, project terms, glossary
+make run MODEL=claude-sonnet-5-5       # compare speed vs. quality
+make run EFFORT=medium HOST=0.0.0.0    # see Troubleshooting for HOST
+```
+
+`make server` / `make translate` run either half on its own (e.g. in two terminals).
+
+`make cc` needs the `claude` CLI installed and logged in. It runs one
+long-running Claude Code session for the whole meeting, counts against your plan's
+usage limits, and keeps the whole meeting as context rather than the last 30 lines.
 
 ## How capturing works
 
 Meet rewrites captions in place while someone is talking, and Japanese ASR revises
-earlier characters often. `content.js` polls the captions panel every 500 ms and
-only commits text once it has been unchanged for 1.5 s, or after 8 s of
-continuous speech (holding back the last few still-changing characters). When the
-recognizer revises text that was already sent, the revised sentence is re-sent and
-the translator is told to skip duplicates.
+earlier characters often. `content.js` polls the captions panel every 250 ms and
+commits text when it has settled:
+
+- a completed sentence (ending in 。？！) once it's unchanged for 0.3 s, even if the
+  speaker keeps talking;
+- everything once the speaker pauses for 0.8 s;
+- as a backstop, after 6 s of speech with no sentence end (holding back the last few
+  still-changing characters). Cutting mid-sentence hurts accuracy since Japanese puts
+  the verb last, so this is deliberately not shorter.
+
+When the recognizer revises text that was already sent, the revised sentence is
+re-sent and the translator is told to skip duplicates. `translate.py` sends lines
+as soon as they reach the file; lines arriving mid-translation go in the next batch.
 
 ## Troubleshooting
 
 - **Nothing captured / badge never turns ON.** Open DevTools on the Meet tab and
   look for `[meet-captions]` logs. Meet's class names are obfuscated and change;
-  update `SELECTORS` at the top of `extension/content.js` (`block` = one speaker's
-  caption entry, `speaker` = name, `text` = caption text). If the block selector
-  stops matching, it falls back to reading the whole captions region with speaker
+  update the selectors at the top of `extension/content.js` (`BLOCK` = one speaker's
+  caption entry, `SPEAKER` = name, `TEXT` = caption text). If `BLOCK` stops
+  matching, it falls back to reading the whole captions region with speaker
   `Unknown`.
 - **Badge shows ERR.** `server.py` isn't running or isn't reachable. With Chrome on
   Windows and the server in WSL2, localhost forwarding normally works; if not,
-  run `server.py --host 0.0.0.0`.
+  run `make run HOST=0.0.0.0`.
 - **After reloading the extension**, refresh the Meet tab.

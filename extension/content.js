@@ -1,190 +1,142 @@
-// Reads Google Meet live captions and forwards finalized text to the local
-// transcript server (via background.js).
+// Reads Google Meet live captions and sends settled text to the local
+// transcript server (via background.js) as "[HH:MM:SS] Speaker: text" lines.
 //
 // Meet rewrites a caption in place while someone is speaking (and Japanese ASR
-// revises earlier characters a lot), so we don't send every DOM change. Each
-// caption block is tracked, and only text that has settled is committed:
-//   - once it hasn't changed for STABLE_MS, or
-//   - once it has been pending MAX_WAIT_MS (minus the still-volatile tail),
-//     so long monologues without pauses still come through.
-
-const CONFIG = {
-  pollMs: 500,
-  stableMs: 1500,
-  maxWaitMs: 8000,
-  volatileTailChars: 12,
-  maxOutbox: 2000,
-  debug: false,
-};
+// revises earlier characters a lot), so text is only sent once it has settled:
+//   - completed sentences (ending in 。？！) once unchanged for SENTENCE_MS,
+//   - the whole caption once unchanged for PAUSE_MS (the speaker paused), or
+//   - after MAX_WAIT_MS with no sentence end, all but the still-changing tail.
+// Cutting mid-sentence hurts translation (Japanese puts the verb last), so the
+// last rule is a backstop, not the normal path.
+const POLL_MS = 250;
+const SENTENCE_MS = 300;
+const PAUSE_MS = 800;
+const MAX_WAIT_MS = 6000;
+const TAIL_CHARS = 12;
 
 // Meet's class names are obfuscated and change from time to time. If captions
-// stop arriving, inspect the captions panel and update these. When the block
-// selector matches nothing, we fall back to reading the whole region as one
-// stream (speaker becomes "Unknown").
-const SELECTORS = {
-  region: [
-    '[role="region"][aria-label="Captions"]',
-    '[role="region"][aria-label="字幕"]', // Meet UI in Japanese
-    '.vNKgIf',
-  ].join(', '),
-  block: '.nMcdL',
-  speaker: '.NWpY1d',
-  text: '.ygicle',
-};
+// stop arriving, inspect the captions panel and update these.
+const REGION = '[role="region"][aria-label="Captions"], [role="region"][aria-label="字幕"], .vNKgIf';
+const BLOCK = '.nMcdL'; // one speaker's caption
+const SPEAKER = '.NWpY1d';
+const TEXT = '.ygicle';
 
-const blocks = new Map(); // Element -> { speaker, committed, lastText, lastChange, pendingSince }
+// Caption element -> { speaker, text, sent, sentences, changedAt, sentencesAt, pendingSince }
+const blocks = new Map();
 const outbox = [];
 let sending = false;
-let mode = null;
-let lastError = null;
-let timer = null;
 
-function log(...args) {
-  console.log('[meet-captions]', ...args);
-}
+const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-function normalize(text) {
-  return (text || '').replace(/\s+/g, ' ').trim();
-}
+// The text up to and including the last sentence-ending mark ('' if none).
+const completed = (text) => (text.match(/.*[。？！?!]/s) || [''])[0];
 
-function setMode(next) {
-  if (mode !== next) {
-    mode = next;
-    log(`reading captions using ${next === 'selectors' ? 'block selectors' : 'fallback (whole region)'}`);
-  }
-}
-
-function readBlocks(region) {
-  const els = region.querySelectorAll(SELECTORS.block);
+function readCaptions() {
+  const region = document.querySelector(REGION);
+  if (!region) return [];
+  const els = [...region.querySelectorAll(BLOCK)];
   if (els.length) {
-    setMode('selectors');
-    return [...els].map((el) => {
-      const speaker = normalize(el.querySelector(SELECTORS.speaker)?.innerText) || 'Unknown';
-      const textEl = el.querySelector(SELECTORS.text);
-      // Without a text element, assume the first line of the block is the speaker name.
-      const text = textEl ? textEl.innerText : el.innerText.split('\n').slice(1).join(' ');
-      return { key: el, speaker, text: normalize(text) };
-    });
+    return els.map((el) => ({
+      el,
+      speaker: clean(el.querySelector(SPEAKER)?.innerText) || 'Unknown',
+      text: clean((el.querySelector(TEXT) || el).innerText),
+    }));
   }
-
-  setMode('fallback');
-  // Skip the "Jump to bottom" button container.
-  const text = [...region.children]
-    .filter((child) => !child.querySelector('button'))
-    .map((child) => child.innerText)
-    .join(' ');
-  return [{ key: region, speaker: 'Unknown', text: normalize(text) }];
+  // BLOCK is out of date: read the whole panel as one speaker, skipping the
+  // "Jump to bottom" button.
+  const text = [...region.children].filter((c) => !c.querySelector('button')).map((c) => c.innerText);
+  return [{ el: region, speaker: 'Unknown', text: clean(text.join(' ')) }];
 }
 
-function commonPrefixLength(a, b) {
-  let i = 0;
-  while (i < a.length && i < b.length && a[i] === b[i]) i++;
-  return i;
-}
+// The part of `text` that hasn't been sent, given `sent` is the caption as of the last send.
+function unsent(sent, text) {
+  if (sent.startsWith(text)) return '';
+  if (text.startsWith(sent)) return text.slice(sent.length);
 
-// Returns the part of `current` that hasn't been sent yet, given that
-// `committed` is the block text as of the last commit.
-function newPortion(committed, current) {
-  if (current.startsWith(committed)) return current.slice(committed.length);
-
-  // Meet trimmed old text off the front of the block: re-anchor on the tail of
-  // what we already sent.
-  for (let n = Math.min(40, committed.length); n >= 8; n--) {
-    const idx = current.lastIndexOf(committed.slice(-n));
-    if (idx !== -1) return current.slice(idx + n);
+  // Meet trimmed old text off the front: re-anchor on the tail of what was sent.
+  for (let n = Math.min(40, sent.length); n >= 8; n--) {
+    const i = text.lastIndexOf(sent.slice(-n));
+    if (i !== -1) return text.slice(i + n);
   }
 
-  // ASR revised text we already sent. Resend the revised sentence (up to 30
-  // chars back) so the translator sees it whole; a little duplication is
+  // ASR revised text that was already sent. Resend the revised sentence (up to
+  // 30 chars back) so the translator sees it whole; a little duplication is
   // better than dropping words.
-  const diverge = commonPrefixLength(committed, current);
-  if (diverge >= current.length) return '';
-  const sentenceStart = Math.max(...SENTENCE_ENDS.map((c) => current.lastIndexOf(c, diverge - 1))) + 1;
-  return current.slice(Math.max(sentenceStart, diverge - 30, 0));
+  let i = 0;
+  while (text[i] === sent[i]) i++;
+  return text.slice(Math.max(completed(text.slice(0, i)).length, i - 30));
 }
 
-const SENTENCE_ENDS = ['。', '？', '！', '?', '!'];
-
-function commit(state, text) {
-  const fresh = normalize(newPortion(state.committed, text)).replace(/^[。、，,.?？!！\s]+/, '');
+function send(state, text) {
+  const fresh = clean(unsent(state.sent, text)).replace(/^[。、，,.?？!！\s]+/, '');
   if (fresh) {
-    outbox.push({ ts: Date.now(), speaker: state.speaker, text: fresh });
-    if (CONFIG.debug) log('commit', state.speaker, fresh);
+    const time = new Date(state.pendingSince).toTimeString().slice(0, 8);
+    outbox.push(`[${time}] ${state.speaker}: ${fresh}\n`);
   }
-  state.committed = text;
-  state.pendingSince = text === state.lastText ? null : Date.now();
+  state.sent = text;
+  state.pendingSince = text === state.text ? null : Date.now();
 }
 
 function tick() {
   const now = Date.now();
   const seen = new Set();
-  const region = document.querySelector(SELECTORS.region);
 
-  if (region) {
-    for (const { key, speaker, text } of readBlocks(region)) {
-      seen.add(key);
-      let state = blocks.get(key);
-      if (!state) {
-        state = { speaker, committed: '', lastText: '', lastChange: now, pendingSince: null };
-        blocks.set(key, state);
-      }
-      state.speaker = speaker;
+  for (const { el, speaker, text } of readCaptions()) {
+    seen.add(el);
+    if (!blocks.has(el)) blocks.set(el, { text: '', sent: '', sentences: '', pendingSince: null });
+    const state = blocks.get(el);
+    state.speaker = speaker;
 
-      if (text !== state.lastText) {
-        state.lastText = text;
-        state.lastChange = now;
-        state.pendingSince ??= now;
-      }
-      if (state.pendingSince === null) continue;
+    if (text !== state.text) {
+      state.text = text;
+      state.changedAt = now;
+      state.pendingSince ??= now;
+    }
+    const sentences = completed(text);
+    if (sentences !== state.sentences) {
+      state.sentences = sentences;
+      state.sentencesAt = now;
+    }
+    if (state.pendingSince === null) continue;
 
-      if (now - state.lastChange >= CONFIG.stableMs) {
-        commit(state, text);
-      } else if (now - state.pendingSince >= CONFIG.maxWaitMs) {
-        commit(state, text.slice(0, -CONFIG.volatileTailChars));
-      }
+    // The startsWith checks skip cuts with nothing new in them; sending one
+    // would rewind `sent` and the text after it would go out twice.
+    const settled = text.slice(0, -TAIL_CHARS);
+    if (now - state.changedAt >= PAUSE_MS) {
+      send(state, text);
+    } else if (now - state.sentencesAt >= SENTENCE_MS && !state.sent.startsWith(sentences)) {
+      send(state, sentences);
+    } else if (now - state.pendingSince >= MAX_WAIT_MS && !state.sent.startsWith(settled)) {
+      send(state, settled);
     }
   }
 
-  // Blocks Meet removed from the panel: flush whatever they last showed.
-  for (const [key, state] of blocks) {
-    if (seen.has(key)) continue;
-    if (state.pendingSince !== null) commit(state, state.lastText);
-    blocks.delete(key);
+  // Captions Meet removed from the panel: send whatever they last showed.
+  for (const [el, state] of blocks) {
+    if (seen.has(el)) continue;
+    if (state.pendingSince !== null) send(state, state.text);
+    blocks.delete(el);
   }
 
   flush();
 }
 
+// Lines stay in the outbox until the server has them, so nothing is lost while it's down.
 async function flush() {
   if (sending || !outbox.length) return;
   sending = true;
-  const batch = outbox.slice();
+  const count = outbox.length;
   try {
-    const res = await chrome.runtime.sendMessage({
-      type: 'captions',
-      meeting: location.pathname.replace(/^\//, ''),
-      lines: batch,
-    });
-    if (res?.ok) {
-      outbox.splice(0, batch.length);
-      if (lastError) log('server reachable again');
-      lastError = null;
-    } else if (res?.error !== lastError) {
-      lastError = res?.error;
-      log(`server error (will retry): ${lastError}. Is server.py running?`);
-    }
+    if (await chrome.runtime.sendMessage(outbox.join(''))) outbox.splice(0, count);
   } catch (err) {
+    console.warn('[meet-captions] send failed:', err);
     if (String(err).includes('Extension context invalidated')) {
-      log('extension was reloaded; refresh this tab to resume capturing');
+      console.warn('[meet-captions] extension was reloaded; refresh this tab to resume capturing');
       clearInterval(timer);
-    } else {
-      log('send failed', err);
     }
-  } finally {
-    if (outbox.length > CONFIG.maxOutbox) outbox.splice(0, outbox.length - CONFIG.maxOutbox);
-    sending = false;
   }
+  sending = false;
 }
 
-log('loaded; turn on captions (CC) in Meet to start capturing');
-timer = setInterval(tick, CONFIG.pollMs);
+console.log('[meet-captions] loaded; turn on captions (CC) in Meet to start capturing');
+const timer = setInterval(tick, POLL_MS);

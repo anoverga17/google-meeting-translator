@@ -1,18 +1,22 @@
 """Tails the caption transcript and translates new Japanese lines to English with Claude.
 
-New lines are batched briefly (speakers pause, ASR splits sentences), sent to
-Claude together with the last few translated lines as context, streamed to the
-terminal, and appended to the translation file.
+New lines are translated as soon as they land in the transcript (the extension
+already waits for captions to settle). Lines that arrive while a translation is
+streaming are sent together in the next request. Output streams to the terminal
+and is appended to the translation file.
 
 Usage:
     python translate.py                                  # transcript.txt -> translation.txt
     python translate.py --notes notes.txt                # add glossary / meeting background
-    python translate.py --from-start                     # also translate what's already in the file
-    python translate.py --model claude-haiku-5-5         # faster/cheaper
+    python translate.py --model claude-sonnet-5-5        # compare speed/quality
+    python translate.py --backend claude-code            # use your Claude plan instead of an API key
 """
 
 import argparse
+import json
+import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
@@ -30,132 +34,142 @@ recognizer revised itself. Use the earlier conversation to resolve ambiguity and
 obvious recognition errors, but don't invent content that isn't there. If text is \
 duplicated from the previous lines, don't translate it twice.
 
+A line may end mid-sentence, before the verb. Translate what is actually there without \
+guessing how the sentence ends (e.g. don't assume affirmative vs. negative); the rest \
+will arrive in the next lines.
+
 Output one line per caption line in <new_captions>, in order, keeping the \
 "[HH:MM:SS] Speaker:" prefix exactly as given (leave speaker names as written). If a \
 line only continues the previous one or is pure filler (e.g. えーと, あの), you may \
-translate it briefly. Output only the translated lines - no notes or commentary."""
+translate it briefly. Output only the translated lines - no XML tags, notes or commentary."""
 
 
-class TranscriptTail:
-    """Yields complete new lines appended to a file, tolerating truncation and rotation."""
-
-    def __init__(self, path: Path, from_start: bool):
-        self.path = path
-        self.pos = 0 if from_start or not path.exists() else path.stat().st_size
-        self.partial = ""
-
-    def read_new_lines(self) -> list[str]:
-        if not self.path.exists():
-            return []
-        size = self.path.stat().st_size
-        if size < self.pos:  # file was truncated or replaced
-            self.pos, self.partial = 0, ""
-        if size == self.pos:
-            return []
-        with self.path.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(self.pos)
-            chunk = f.read()
-            self.pos = f.tell()
-        *lines, self.partial = (self.partial + chunk).split("\n")
-        return [line for line in lines if line.strip()]
+def tagged(tag: str, lines) -> str:
+    return f"<{tag}>\n" + "\n".join(lines) + f"\n</{tag}>"
 
 
-class Translator:
-    def __init__(self, model: str, effort: str, notes: str | None, context_lines: int):
-        self.client = anthropic.Anthropic()
-        self.model = model
-        self.effort = effort
-        self.system = SYSTEM_PROMPT
-        if notes:
-            self.system += f"\n\n<meeting_notes>\n{notes.strip()}\n</meeting_notes>"
-        self.source_history: deque[str] = deque(maxlen=context_lines)
-        self.english_history: deque[str] = deque(maxlen=context_lines)
+def api_backend(model: str, effort: str, system: str, context_lines: int = 30):
+    """Calls the Claude API directly (needs ANTHROPIC_API_KEY), with the last few lines as context."""
+    client = anthropic.Anthropic()
+    client.models.retrieve(model)  # fail on a bad key or model name now, not at the first caption
+    captions, translations = deque(maxlen=context_lines), deque(maxlen=context_lines)
 
-    def _prompt(self, lines: list[str]) -> str:
-        parts = []
-        if self.source_history:
-            parts.append("<previous_captions>\n" + "\n".join(self.source_history) + "\n</previous_captions>")
-            parts.append("<previous_translation>\n" + "\n".join(self.english_history) + "\n</previous_translation>")
-        parts.append("<new_captions>\n" + "\n".join(lines) + "\n</new_captions>")
-        return "\n\n".join(parts)
-
-    def translate(self, lines: list[str], on_text) -> str | None:
-        """Streams the translation of `lines` through on_text; returns the full text, or None if refused."""
-        with self.client.beta.messages.stream(
-            model=self.model,
+    def translate(lines: list[str]):
+        parts = [tagged("new_captions", lines)]
+        if captions:
+            parts = [tagged("previous_captions", captions), tagged("previous_translation", translations)] + parts
+        with client.beta.messages.stream(
+            model=model,
             max_tokens=16000,
-            system=self.system,
-            output_config={"effort": self.effort},
+            system=system,
+            output_config={"effort": effort},
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
-            messages=[{"role": "user", "content": self._prompt(lines)}],
+            messages=[{"role": "user", "content": "\n\n".join(parts)}],
         ) as stream:
-            for text in stream.text_stream:
-                on_text(text)
+            yield from stream.text_stream
             final = stream.get_final_message()
-
         if final.stop_reason == "refusal":
-            return None
-        english = "".join(b.text for b in final.content if b.type == "text").strip()
-        self.source_history.extend(lines)
-        self.english_history.extend(english.splitlines())
-        return english
+            print("\n[Claude declined to translate this batch; skipped]", file=sys.stderr, flush=True)
+            return
+        captions.extend(lines)
+        translations.extend("".join(b.text for b in final.content if b.type == "text").strip().splitlines())
+
+    return translate
+
+
+def claude_code_backend(model: str, effort: str, system: str):
+    """Translates through one long-running Claude Code session (uses your Claude plan, no API key).
+
+    The session keeps the whole meeting as conversation history, so each turn
+    only carries the new captions. Claude Code compacts the history itself if a
+    meeting runs long.
+    """
+    proc = subprocess.Popen(
+        [
+            "claude", "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+            "--system-prompt", system,
+            "--tools", "",
+            "--model", model,
+            "--effort", effort,
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--setting-sources", "",
+        ],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
+        cwd=tempfile.mkdtemp(prefix="meet-translate-"),  # outside the project, so no CLAUDE.md leaks in
+    )
+
+    def turn(content: str):
+        message = {"type": "user", "message": {"role": "user", "content": content}}
+        if proc.poll() is None:
+            proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+        for raw in proc.stdout:
+            event = json.loads(raw)
+            if event.get("type") == "stream_event":
+                delta = event["event"].get("delta", {})
+                if delta.get("type") == "text_delta":
+                    yield delta["text"]
+            elif event.get("type") == "result":
+                if event.get("is_error"):
+                    raise RuntimeError(event.get("result") or event.get("subtype") or "unknown error")
+                return
+        sys.exit(f"Claude Code exited (code {proc.wait()})")
+
+    # Start the session (and check the login and model name) before the first caption.
+    list(turn("Setup check before the meeting starts. Reply with just: ready"))
+    return lambda lines: turn(tagged("new_captions", lines))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--backend", default="api", choices=["api", "claude-code"],
+                        help="api: Claude API with ANTHROPIC_API_KEY; claude-code: your Claude plan via the claude CLI")
     parser.add_argument("--transcript", default="transcript.txt")
     parser.add_argument("--out", default="translation.txt")
     parser.add_argument("--model", default="claude-opus-5-5")
     parser.add_argument("--effort", default="low", choices=["low", "medium", "high", "xhigh", "max"],
                         help="lower is faster; low is usually plenty for translation")
     parser.add_argument("--notes", help="file with meeting background, names, or a glossary")
-    parser.add_argument("--from-start", action="store_true", help="translate lines already in the transcript")
-    parser.add_argument("--debounce", type=float, default=1.5,
-                        help="seconds of caption silence before translating a batch")
-    parser.add_argument("--max-wait", type=float, default=6.0,
-                        help="translate a batch after this many seconds even if captions keep coming")
-    parser.add_argument("--context-lines", type=int, default=30)
     args = parser.parse_args()
 
-    notes = Path(args.notes).read_text(encoding="utf-8") if args.notes else None
-    tail = TranscriptTail(Path(args.transcript), args.from_start)
-    translator = Translator(args.model, args.effort, notes, args.context_lines)
-    out_path = Path(args.out)
+    system = SYSTEM_PROMPT
+    if args.notes:
+        system += "\n\n" + tagged("meeting_notes", [Path(args.notes).read_text(encoding="utf-8").strip()])
+    backend = api_backend if args.backend == "api" else claude_code_backend
+    translate = backend(args.model, args.effort, system)
 
-    print(f"Watching {Path(args.transcript).resolve()} -> {out_path.resolve()} ({args.model})", flush=True)
-
-    pending: list[str] = []
-    first_at = last_at = 0.0
-    while True:
-        new = tail.read_new_lines()
-        now = time.monotonic()
-        if new:
-            if not pending:
-                first_at = now
-            pending.extend(new)
-            last_at = now
-
-        if pending and (now - last_at >= args.debounce or now - first_at >= args.max_wait):
-            batch, pending = pending, []
+    Path(args.transcript).touch()
+    print(f"Watching {args.transcript} -> {args.out} ({args.model})", flush=True)
+    with open(args.transcript, encoding="utf-8") as transcript, open(args.out, "a", encoding="utf-8") as out:
+        transcript.seek(0, 2)  # only translate what's said from now on
+        lines, partial = [], ""
+        while True:
+            *new, partial = (partial + transcript.read()).split("\n")
+            lines += [line for line in new if line.strip()]
+            if not lines:
+                time.sleep(0.1)
+                continue
+            english = ""
             try:
-                english = translator.translate(batch, lambda t: print(t, end="", flush=True))
-            except anthropic.AuthenticationError:
-                sys.exit("Authentication failed: set ANTHROPIC_API_KEY (or run `ant auth login`).")
-            except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APIStatusError) as exc:
+                for text in translate(lines):
+                    print(text, end="", flush=True)
+                    english += text
+            except Exception as exc:
+                # Retrying can't fix a bad request, key or model; anything else is assumed transient.
+                if isinstance(exc, anthropic.APIStatusError) and exc.status_code < 500 and exc.status_code != 429:
+                    raise
                 print(f"\n[translate error, will retry: {exc}]", file=sys.stderr, flush=True)
-                pending = batch + pending
                 time.sleep(3)
-                continue
+                continue  # `lines` is kept, so the batch is retried along with anything new
             print(flush=True)
-
-            if english is None:
-                print("[Claude declined to translate this batch; skipped]", file=sys.stderr, flush=True)
-                continue
-            with out_path.open("a", encoding="utf-8") as f:
-                f.write(english + "\n")
-
-        time.sleep(0.25)
+            if english.strip():
+                out.write(english.strip() + "\n")
+                out.flush()
+            lines = []
 
 
 if __name__ == "__main__":
