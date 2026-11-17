@@ -6,22 +6,16 @@
 # make server / make translate  run either half on its own (e.g. `make translate RECAP=0` for live next to a recap)
 
 PY         := .venv/bin/python
-BACKEND    ?= api
-MODEL      ?= claude-opus-5-5
 TRANSCRIPT ?= transcript.txt
 HOST       ?= 127.0.0.1
-# Left empty, these default by mode in translate.py: a recap every 30 s at medium
-# effort into recap.txt, or with RECAP=0, live at low effort into translation.txt.
-RECAP      ?=
-EFFORT     ?=
-OUT        ?=
-NOTES      ?=
-TO         ?=
-REPO       ?=
+# Optional: BACKEND MODEL RECAP EFFORT OUT NOTES TO REPO. Unset, translate.py's defaults
+# apply: the API, Opus, a recap every 30 s at medium effort into recap.txt (or with
+# RECAP=0, live at low effort into translation.txt).
 
 SERVER_ARGS    := --out $(TRANSCRIPT) --host $(HOST)
-TRANSLATE_ARGS := --backend $(BACKEND) --model $(MODEL) --transcript $(TRANSCRIPT) \
-                  $(if $(RECAP),--recap $(RECAP)) $(if $(EFFORT),--effort $(EFFORT)) \
+TRANSLATE_ARGS := --transcript $(TRANSCRIPT) $(if $(BACKEND),--backend $(BACKEND)) \
+                  $(if $(MODEL),--model $(MODEL)) $(if $(RECAP),--recap $(RECAP)) \
+                  $(if $(EFFORT),--effort $(EFFORT)) \
                   $(if $(OUT),--out $(OUT)) $(if $(NOTES),--notes $(NOTES)) \
                   $(if $(REPO),--repo $(REPO)) $(if $(TO),--to "$(TO)")
 

@@ -6,7 +6,7 @@ them with Claude into the language of your choice (English by default).
 ```
 Meet tab ──(content.js)──> background.js ──POST──> server.py ──> transcript.txt
                                                                       │ tail
-                                                     translate.py <───┘ ──> terminal + translation.txt
+                                                     translate.py <───┘ ──> terminal + recap.txt
 ```
 
 The transcript is plain text (`[HH:MM:SS] Speaker: text`), so you can also point
@@ -94,8 +94,7 @@ captions panel every 250 ms and commits text when it has settled:
   the verb last), so this is deliberately not shorter.
 
 When the recognizer revises text that was already sent, the revised sentence is
-re-sent and the translator is told to skip duplicates. `translate.py` sends lines
-as soon as they reach the file; lines arriving mid-translation go in the next batch.
+re-sent and the translator is told to skip duplicates.
 
 ## Troubleshooting
 

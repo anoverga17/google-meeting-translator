@@ -27,24 +27,28 @@ from pathlib import Path
 
 import anthropic
 
-SYSTEM_PROMPT = """\
+# Shared by both prompts below, as {noise}.
+NOISE_NOTE = """\
+The captions are noisy: expect missing punctuation, misrecognized words (often \
+homophones), sentences split across lines, filler, and text repeated where the \
+recognizer revised itself. Use the earlier conversation to resolve ambiguity and fix \
+obvious recognition errors, but don't invent content that isn't there.
+When you fix a recognition error with confidence, just use the corrected term. Only \
+when part of a caption is too garbled to be sure of, give your best guess followed by the \
+original caption text, as: guess [? original]. Keep these rare (only for words that \
+matter), and never just drop the text or write "unclear"."""
+
+LIVE_PROMPT = """\
 You are a live interpreter for a Google Meet call. You receive automatic \
 speech-recognition captions in the meeting's language and translate them into natural, \
 accurate {target} for someone following along in real time.
 
-The captions are noisy: expect missing punctuation, misrecognized words (often \
-homophones), sentences split across lines, and occasionally repeated text where the \
-recognizer revised itself. Use the earlier conversation to resolve ambiguity and fix \
-obvious recognition errors, but don't invent content that isn't there. If text is \
-duplicated from the previous lines, don't translate it twice.
-When you fix a recognition error with confidence, just use the corrected term. Only \
-when part of a caption is too garbled to be sure of, give your best guess followed by the \
-original caption text, as: guess [? original]. Keep these rare (only for words that \
-matter), and never just drop the text or write "unclear".
+{noise}
 
-A line may end mid-sentence (in some languages, before the verb). Translate what is \
-actually there without guessing how the sentence ends (e.g. don't assume affirmative \
-vs. negative); the rest will arrive in the next lines.
+If text is duplicated from the previous lines, don't translate it twice. A line may end \
+mid-sentence (in some languages, before the verb). Translate what is actually there \
+without guessing how the sentence ends (e.g. don't assume affirmative vs. negative); the \
+rest will arrive in the next lines.
 
 Output one line per caption line in <new_captions>, in order, keeping the \
 "[HH:MM:SS] Speaker:" prefix exactly as given (leave speaker names as written). If a \
@@ -57,14 +61,7 @@ They have a rough line-by-line live translation; every half minute or so you rec
 automatic speech-recognition captions since your last reply, and write the readable \
 version they catch up from.
 
-The captions are noisy: expect misrecognized words (often homophones), sentences split \
-across lines, filler, and text repeated where the recognizer revised itself. Use the \
-earlier conversation to resolve ambiguity and fix obvious recognition errors, but don't \
-invent content that isn't there.
-When you fix a recognition error with confidence, just use the corrected term. Only \
-when part of a caption is too garbled to be sure of, give your best guess followed by the \
-original caption text, as: guess [? original]. Keep these rare (only for words that \
-matter), and never just drop the text or write "unclear".
+{noise}
 
 Reply in this format, with no XML tags or commentary:
 [HH:MM:SS] Speaker: <what they said, in clean natural {target}>
@@ -196,7 +193,7 @@ def main():
     args.out = args.out or ("recap.txt" if args.recap else "translation.txt")
     args.effort = args.effort or ("medium" if args.recap else "low")
 
-    system = (RECAP_PROMPT if args.recap else SYSTEM_PROMPT).format(target=args.to)
+    system = (RECAP_PROMPT if args.recap else LIVE_PROMPT).format(target=args.to, noise=NOISE_NOTE)
     if args.notes:
         system += "\n\n" + tagged("meeting_notes", [Path(args.notes).read_text(encoding="utf-8").strip()])
     if args.repo:
