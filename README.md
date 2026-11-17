@@ -30,11 +30,23 @@ folder to a Windows path and load that.)
 ```bash
 make run     # transcript server + translator via the Claude API
 make cc      # same, but translate through Claude Code on your Claude plan
+make live    # line-by-line live translation instead of the recap
 ```
 
-Both start the transcript server in the background (logging to `server.log`;
-`tail -f server.log` to watch raw captions) and the translator in the foreground,
-which streams English and appends it to `translation.txt`. Ctrl+C stops both.
+Each starts the transcript server in the background (logging to `server.log`;
+`tail -f server.log` to watch raw captions) and the translator in the foreground.
+Ctrl+C stops both.
+
+By default the translator writes a recap: every minute it turns the new captions
+into readable English (one paragraph per speaker turn, fragments merged, fillers
+dropped) and appends it to `recap.txt`. It's a cleaned-up translation, not a
+summary, so nothing said is left out. It runs at medium effort, trading speed for
+accuracy on technical talk.
+
+`make live` instead translates each caption line as it arrives, at low effort, into
+`translation.txt`: faster but choppier, since captions arrive in fragments. For
+both at once, run `make translate RECAP=0` (add `BACKEND=claude-code` for your plan)
+in a second terminal next to `make run` / `make cc`.
 
 Then join the Meet, turn on captions (CC) and set the caption language to
 Japanese. The extension badge shows **ON** when captions reach the server and
@@ -44,11 +56,19 @@ Options are make variables:
 
 ```bash
 make run NOTES=notes.txt               # names, project terms, glossary
+make cc REPO=path/to/docs              # let Claude look up names and terms there
+make run RECAP=120                     # recap every 2 minutes instead of every minute
 make run MODEL=claude-sonnet-5-5       # compare speed vs. quality
-make run EFFORT=medium HOST=0.0.0.0    # see Troubleshooting for HOST
+make run EFFORT=high HOST=0.0.0.0      # see Troubleshooting for HOST
 ```
 
 `make server` / `make translate` run either half on its own (e.g. in two terminals).
+
+`REPO` (Claude Code only) points at a repository or folder describing the systems
+being discussed (docs, code, a glossary).
+When the captions mention a system name or technical term Claude can't place
+(speech recognition garbles these a lot), it searches that folder (read-only) to
+find the right term. Each recap takes a few seconds longer.
 
 `make cc` needs the `claude` CLI installed and logged in. It runs one
 long-running Claude Code session for the whole meeting, counts against your plan's

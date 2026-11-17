@@ -1,22 +1,30 @@
-# make run                      start the transcript server + translator (Claude API)
-# make cc                       same, but translate through Claude Code on your Claude plan
-# make run NOTES=notes.txt MODEL=claude-sonnet-5-5
-# make server / make translate  run either half on its own
+# make run                      start the transcript server + a readable recap every minute (Claude API)
+# make cc                       same, but through Claude Code on your Claude plan
+# make live                     line-by-line live translation instead (add BACKEND=claude-code for your plan)
+# make run NOTES=notes.txt RECAP=120 MODEL=claude-sonnet-5-5
+# make cc REPO=path/to/docs     let the recap look up names and terms in a docs/code folder
+# make server / make translate  run either half on its own (e.g. `make translate RECAP=0` for live next to a recap)
 
 PY         := .venv/bin/python
 BACKEND    ?= api
 MODEL      ?= claude-opus-5-5
-EFFORT     ?= low
 TRANSCRIPT ?= transcript.txt
-OUT        ?= translation.txt
 HOST       ?= 127.0.0.1
+# Left empty, these default by mode in translate.py: a recap every 60 s at medium
+# effort into recap.txt, or with RECAP=0, live at low effort into translation.txt.
+RECAP      ?=
+EFFORT     ?=
+OUT        ?=
 NOTES      ?=
+REPO       ?=
 
 SERVER_ARGS    := --out $(TRANSCRIPT) --host $(HOST)
-TRANSLATE_ARGS := --backend $(BACKEND) --model $(MODEL) --effort $(EFFORT) \
-                  --transcript $(TRANSCRIPT) --out $(OUT) $(if $(NOTES),--notes $(NOTES))
+TRANSLATE_ARGS := --backend $(BACKEND) --model $(MODEL) --transcript $(TRANSCRIPT) \
+                  $(if $(RECAP),--recap $(RECAP)) $(if $(EFFORT),--effort $(EFFORT)) \
+                  $(if $(OUT),--out $(OUT)) $(if $(NOTES),--notes $(NOTES)) \
+                  $(if $(REPO),--repo $(REPO))
 
-.PHONY: run cc server translate install clean
+.PHONY: run cc live server translate install clean
 
 # The server logs to server.log so the terminal shows only translations
 # (`tail -f server.log` in another terminal to watch raw captions).
@@ -29,6 +37,9 @@ run: install
 
 cc:
 	@$(MAKE) --no-print-directory run BACKEND=claude-code
+
+live:
+	@$(MAKE) --no-print-directory run RECAP=0
 
 server: install
 	$(PY) server.py $(SERVER_ARGS)

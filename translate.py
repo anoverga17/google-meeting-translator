@@ -1,12 +1,14 @@
-"""Tails the caption transcript and translates new Japanese lines to English with Claude.
+"""Tails the caption transcript and translates it from Japanese to English with Claude.
 
-New lines are translated as soon as they land in the transcript (the extension
-already waits for captions to settle). Lines that arrive while a translation is
-streaming are sent together in the next request. Output streams to the terminal
-and is appended to the translation file.
+By default, every minute the new captions are turned into a readable English recap
+(fragments merged, repeats dropped) and appended to recap.txt. With --recap 0, lines
+are instead translated as soon as they land in the transcript and appended to
+translation.txt; lines that arrive while a translation is streaming go in the next
+request. Output also streams to the terminal.
 
 Usage:
-    python translate.py                                  # transcript.txt -> translation.txt
+    python translate.py                                  # transcript.txt -> recap.txt every minute
+    python translate.py --recap 0                        # live, line by line -> translation.txt
     python translate.py --notes notes.txt                # add glossary / meeting background
     python translate.py --model claude-sonnet-5-5        # compare speed/quality
     python translate.py --backend claude-code            # use your Claude plan instead of an API key
@@ -43,6 +45,34 @@ Output one line per caption line in <new_captions>, in order, keeping the \
 line only continues the previous one or is pure filler (e.g. えーと, あの), you may \
 translate it briefly. Output only the translated lines - no XML tags, notes or commentary."""
 
+RECAP_PROMPT = """\
+You help an English speaker follow a Google Meet call held in Japanese. They have a rough \
+line-by-line live translation; every minute or so you receive the automatic \
+speech-recognition captions since your last reply, and write the readable version they \
+catch up from.
+
+The captions are noisy: expect misrecognized words (often homophones), sentences split \
+across lines, filler, and text repeated where the recognizer revised itself. Use the \
+earlier conversation to resolve ambiguity and fix obvious recognition errors, but don't \
+invent content that isn't there.
+
+Reply in this format, with no XML tags or commentary:
+[HH:MM:SS] Speaker: <what they said, in clean natural English>
+
+Write one paragraph per speaker turn, using the timestamp of its first caption line. Merge \
+fragments into whole sentences and drop fillers, false starts and repeats, but keep every \
+point, question, decision, number and name - this is a cleaned-up translation, not a \
+summary. If the captions end mid-sentence, leave that sentence out and begin your next \
+reply with it."""
+
+REPO_NOTE = """\
+Documentation or code for the systems being discussed (names, components, terminology) \
+is in the directory {repo}. Speech recognition often garbles system names, acronyms and technical \
+terms: when the captions mention one you can't confidently identify, search that directory \
+with Grep, Glob and Read to find the right term and understand what is being discussed. \
+Keep it to a few targeted lookups per reply. Your reply must contain only the translation \
+in the format above, with nothing about the lookups."""
+
 
 def tagged(tag: str, lines) -> str:
     return f"<{tag}>\n" + "\n".join(lines) + f"\n</{tag}>"
@@ -78,25 +108,29 @@ def api_backend(model: str, effort: str, system: str, context_lines: int = 30):
     return translate
 
 
-def claude_code_backend(model: str, effort: str, system: str):
+def claude_code_backend(model: str, effort: str, system: str, repo: str | None = None):
     """Translates through one long-running Claude Code session (uses your Claude plan, no API key).
 
     The session keeps the whole meeting as conversation history, so each turn
     only carries the new captions. Claude Code compacts the history itself if a
-    meeting runs long.
+    meeting runs long. With `repo`, Claude can search that directory (read-only)
+    to identify system terms; only its final reply is shown, not the lookups.
     """
+    lookup = "Read,Grep,Glob"
+    tools = ["--tools", lookup, "--allowedTools", lookup, "--add-dir", repo] if repo else ["--tools", ""]
     proc = subprocess.Popen(
         [
             "claude", "-p",
             "--input-format", "stream-json",
             "--output-format", "stream-json", "--verbose", "--include-partial-messages",
             "--system-prompt", system,
-            "--tools", "",
             "--model", model,
             "--effort", effort,
+            "--permission-mode", "dontAsk",  # never stop to ask; anything not allowed is denied
             "--no-session-persistence",
             "--strict-mcp-config",
             "--setting-sources", "",
+            *tools,
         ],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
         cwd=tempfile.mkdtemp(prefix="meet-translate-"),  # outside the project, so no CLAUDE.md leaks in
@@ -109,13 +143,15 @@ def claude_code_backend(model: str, effort: str, system: str):
             proc.stdin.flush()
         for raw in proc.stdout:
             event = json.loads(raw)
-            if event.get("type") == "stream_event":
+            if event.get("type") == "stream_event" and not repo:
                 delta = event["event"].get("delta", {})
                 if delta.get("type") == "text_delta":
                     yield delta["text"]
             elif event.get("type") == "result":
                 if event.get("is_error"):
                     raise RuntimeError(event.get("result") or event.get("subtype") or "unknown error")
+                if repo:  # streamed text would include any remarks made between lookups
+                    yield event.get("result", "")
                 return
         sys.exit(f"Claude Code exited (code {proc.wait()})")
 
@@ -129,30 +165,43 @@ def main():
     parser.add_argument("--backend", default="api", choices=["api", "claude-code"],
                         help="api: Claude API with ANTHROPIC_API_KEY; claude-code: your Claude plan via the claude CLI")
     parser.add_argument("--transcript", default="transcript.txt")
-    parser.add_argument("--out", default="translation.txt")
+    parser.add_argument("--out", help="default: recap.txt, or translation.txt with --recap 0")
     parser.add_argument("--model", default="claude-opus-5-5")
-    parser.add_argument("--effort", default="low", choices=["low", "medium", "high", "xhigh", "max"],
-                        help="lower is faster; low is usually plenty for translation")
+    parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"],
+                        help="lower is faster; default: medium for recaps, low for live")
     parser.add_argument("--notes", help="file with meeting background, names, or a glossary")
+    parser.add_argument("--repo", help="your system's repo/docs, searched for system names and terms (claude-code only)")
+    parser.add_argument("--recap", type=float, default=60, metavar="SECONDS",
+                        help="write a readable recap every SECONDS (default 60); 0 translates live, line by line")
     args = parser.parse_args()
+    args.out = args.out or ("recap.txt" if args.recap else "translation.txt")
+    args.effort = args.effort or ("medium" if args.recap else "low")
 
-    system = SYSTEM_PROMPT
+    system = RECAP_PROMPT if args.recap else SYSTEM_PROMPT
     if args.notes:
         system += "\n\n" + tagged("meeting_notes", [Path(args.notes).read_text(encoding="utf-8").strip()])
-    backend = api_backend if args.backend == "api" else claude_code_backend
-    translate = backend(args.model, args.effort, system)
+    if args.repo:
+        if args.backend != "claude-code" or not Path(args.repo).is_dir():
+            parser.error("--repo needs --backend claude-code and an existing directory")
+        args.repo = str(Path(args.repo).resolve())  # Claude Code runs from a temp dir
+        system += "\n\n" + tagged("system_repo", [REPO_NOTE.format(repo=args.repo)])
+    if args.backend == "api":
+        translate = api_backend(args.model, args.effort, system)
+    else:
+        translate = claude_code_backend(args.model, args.effort, system, args.repo)
 
     Path(args.transcript).touch()
     print(f"Watching {args.transcript} -> {args.out} ({args.model})", flush=True)
     with open(args.transcript, encoding="utf-8") as transcript, open(args.out, "a", encoding="utf-8") as out:
         transcript.seek(0, 2)  # only translate what's said from now on
-        lines, partial = [], ""
+        lines, partial, sent_at = [], "", time.monotonic()
         while True:
             *new, partial = (partial + transcript.read()).split("\n")
             lines += [line for line in new if line.strip()]
-            if not lines:
+            if not lines or time.monotonic() - sent_at < args.recap:
                 time.sleep(0.1)
                 continue
+            sent_at = time.monotonic()
             english = ""
             try:
                 for text in translate(lines):
@@ -165,9 +214,10 @@ def main():
                 print(f"\n[translate error, will retry: {exc}]", file=sys.stderr, flush=True)
                 time.sleep(3)
                 continue  # `lines` is kept, so the batch is retried along with anything new
-            print(flush=True)
+            gap = "\n\n" if args.recap else "\n"  # blank line between recaps
+            print(end=gap, flush=True)
             if english.strip():
-                out.write(english.strip() + "\n")
+                out.write(english.strip() + gap)
                 out.flush()
             lines = []
 
