@@ -1,21 +1,23 @@
-"""Tails the caption transcript and translates it from Japanese to English with Claude.
+"""Tails the caption transcript and translates it into another language with Claude.
 
-By default, every minute the new captions are turned into a readable English recap
+By default, every 30 seconds the new captions are turned into a readable recap
 (fragments merged, repeats dropped) and appended to recap.txt. With --recap 0, lines
 are instead translated as soon as they land in the transcript and appended to
 translation.txt; lines that arrive while a translation is streaming go in the next
 request. Output also streams to the terminal.
 
 Usage:
-    python translate.py                                  # transcript.txt -> recap.txt every minute
+    python translate.py                                  # transcript.txt -> recap.txt every 30 s
     python translate.py --recap 0                        # live, line by line -> translation.txt
     python translate.py --notes notes.txt                # add glossary / meeting background
     python translate.py --model claude-sonnet-5-5        # compare speed/quality
     python translate.py --backend claude-code            # use your Claude plan instead of an API key
+    python translate.py --to Spanish                     # translate into Spanish instead of English
 """
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,38 +28,46 @@ from pathlib import Path
 import anthropic
 
 SYSTEM_PROMPT = """\
-You are a live interpreter for a Google Meet call held in Japanese. You receive \
-automatic speech-recognition captions and translate them into natural, accurate English \
-for an English speaker following along in real time.
+You are a live interpreter for a Google Meet call. You receive automatic \
+speech-recognition captions in the meeting's language and translate them into natural, \
+accurate {target} for someone following along in real time.
 
 The captions are noisy: expect missing punctuation, misrecognized words (often \
 homophones), sentences split across lines, and occasionally repeated text where the \
 recognizer revised itself. Use the earlier conversation to resolve ambiguity and fix \
 obvious recognition errors, but don't invent content that isn't there. If text is \
 duplicated from the previous lines, don't translate it twice.
+When you fix a recognition error with confidence, just use the corrected term. Only \
+when part of a caption is too garbled to be sure of, give your best guess followed by the \
+original caption text, as: guess [? original]. Keep these rare (only for words that \
+matter), and never just drop the text or write "unclear".
 
-A line may end mid-sentence, before the verb. Translate what is actually there without \
-guessing how the sentence ends (e.g. don't assume affirmative vs. negative); the rest \
-will arrive in the next lines.
+A line may end mid-sentence (in some languages, before the verb). Translate what is \
+actually there without guessing how the sentence ends (e.g. don't assume affirmative \
+vs. negative); the rest will arrive in the next lines.
 
 Output one line per caption line in <new_captions>, in order, keeping the \
 "[HH:MM:SS] Speaker:" prefix exactly as given (leave speaker names as written). If a \
-line only continues the previous one or is pure filler (e.g. えーと, あの), you may \
+line only continues the previous one or is pure filler (e.g. "um", "uh"), you may \
 translate it briefly. Output only the translated lines - no XML tags, notes or commentary."""
 
 RECAP_PROMPT = """\
-You help an English speaker follow a Google Meet call held in Japanese. They have a rough \
-line-by-line live translation; every minute or so you receive the automatic \
-speech-recognition captions since your last reply, and write the readable version they \
-catch up from.
+You help someone who reads {target} follow a Google Meet call in another language. \
+They have a rough line-by-line live translation; every half minute or so you receive the \
+automatic speech-recognition captions since your last reply, and write the readable \
+version they catch up from.
 
 The captions are noisy: expect misrecognized words (often homophones), sentences split \
 across lines, filler, and text repeated where the recognizer revised itself. Use the \
 earlier conversation to resolve ambiguity and fix obvious recognition errors, but don't \
 invent content that isn't there.
+When you fix a recognition error with confidence, just use the corrected term. Only \
+when part of a caption is too garbled to be sure of, give your best guess followed by the \
+original caption text, as: guess [? original]. Keep these rare (only for words that \
+matter), and never just drop the text or write "unclear".
 
 Reply in this format, with no XML tags or commentary:
-[HH:MM:SS] Speaker: <what they said, in clean natural English>
+[HH:MM:SS] Speaker: <what they said, in clean natural {target}>
 
 Write one paragraph per speaker turn, using the timestamp of its first caption line. Merge \
 fragments into whole sentences and drop fillers, false starts and repeats, but keep every \
@@ -72,6 +82,13 @@ terms: when the captions mention one you can't confidently identify, search that
 with Grep, Glob and Read to find the right term and understand what is being discussed. \
 Keep it to a few targeted lookups per reply. Your reply must contain only the translation \
 in the format above, with nothing about the lookups."""
+
+
+def grey_guesses(text: str) -> str:
+    """Greys out "[? original caption]" notes in the terminal, so the translation reads first."""
+    if not sys.stdout.isatty():
+        return text
+    return re.sub(r"\[\?[^\]\n]*\]", lambda m: f"\033[90m{m[0]}\033[0m", text)
 
 
 def tagged(tag: str, lines) -> str:
@@ -169,15 +186,17 @@ def main():
     parser.add_argument("--model", default="claude-opus-5-5")
     parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"],
                         help="lower is faster; default: medium for recaps, low for live")
+    parser.add_argument("--to", default="English", metavar="LANGUAGE",
+                        help="language to translate into (the captions' language is detected)")
     parser.add_argument("--notes", help="file with meeting background, names, or a glossary")
     parser.add_argument("--repo", help="your system's repo/docs, searched for system names and terms (claude-code only)")
-    parser.add_argument("--recap", type=float, default=60, metavar="SECONDS",
-                        help="write a readable recap every SECONDS (default 60); 0 translates live, line by line")
+    parser.add_argument("--recap", type=float, default=30, metavar="SECONDS",
+                        help="write a readable recap every SECONDS (default 30); 0 translates live, line by line")
     args = parser.parse_args()
     args.out = args.out or ("recap.txt" if args.recap else "translation.txt")
     args.effort = args.effort or ("medium" if args.recap else "low")
 
-    system = RECAP_PROMPT if args.recap else SYSTEM_PROMPT
+    system = (RECAP_PROMPT if args.recap else SYSTEM_PROMPT).format(target=args.to)
     if args.notes:
         system += "\n\n" + tagged("meeting_notes", [Path(args.notes).read_text(encoding="utf-8").strip()])
     if args.repo:
@@ -202,11 +221,14 @@ def main():
                 time.sleep(0.1)
                 continue
             sent_at = time.monotonic()
-            english = ""
+            translated, shown = "", 0
             try:
                 for text in translate(lines):
-                    print(text, end="", flush=True)
-                    english += text
+                    translated += text
+                    # Print whole lines, so a [? ...] note split across chunks can still be greyed.
+                    end = translated.rfind("\n") + 1
+                    print(grey_guesses(translated[shown:end]), end="", flush=True)
+                    shown = end
             except Exception as exc:
                 # Retrying can't fix a bad request, key or model; anything else is assumed transient.
                 if isinstance(exc, anthropic.APIStatusError) and exc.status_code < 500 and exc.status_code != 429:
@@ -215,9 +237,9 @@ def main():
                 time.sleep(3)
                 continue  # `lines` is kept, so the batch is retried along with anything new
             gap = "\n\n" if args.recap else "\n"  # blank line between recaps
-            print(end=gap, flush=True)
-            if english.strip():
-                out.write(english.strip() + gap)
+            print(grey_guesses(translated[shown:]), end=gap, flush=True)
+            if translated.strip():
+                out.write(translated.strip() + gap)
                 out.flush()
             lines = []
 

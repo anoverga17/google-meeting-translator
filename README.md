@@ -1,7 +1,7 @@
 # Meet caption translator
 
-Captures Google Meet live captions (Japanese) into a raw transcript file, and
-translates it to English with Claude in near real time.
+Captures Google Meet live captions into a raw transcript file, and translates
+them with Claude into the language of your choice (English by default).
 
 ```
 Meet tab ──(content.js)──> background.js ──POST──> server.py ──> transcript.txt
@@ -37,27 +37,32 @@ Each starts the transcript server in the background (logging to `server.log`;
 `tail -f server.log` to watch raw captions) and the translator in the foreground.
 Ctrl+C stops both.
 
-By default the translator writes a recap: every minute it turns the new captions
-into readable English (one paragraph per speaker turn, fragments merged, fillers
+By default the translator writes a recap: every 30 seconds it turns the new captions
+into readable translated text (one paragraph per speaker turn, fragments merged, fillers
 dropped) and appends it to `recap.txt`. It's a cleaned-up translation, not a
 summary, so nothing said is left out. It runs at medium effort, trading speed for
 accuracy on technical talk.
+
+Where the captions are too garbled to be sure of, Claude gives its best guess followed
+by the original caption text, like `IMS [? isa]`. In the terminal these notes are
+greyed out so you can read the translation first and check them afterwards.
 
 `make live` instead translates each caption line as it arrives, at low effort, into
 `translation.txt`: faster but choppier, since captions arrive in fragments. For
 both at once, run `make translate RECAP=0` (add `BACKEND=claude-code` for your plan)
 in a second terminal next to `make run` / `make cc`.
 
-Then join the Meet, turn on captions (CC) and set the caption language to
-Japanese. The extension badge shows **ON** when captions reach the server and
+Then join the Meet, turn on captions (CC) and set the caption language to the
+language being spoken. The extension badge shows **ON** when captions reach the server and
 **ERR** when the server isn't reachable (captions are buffered and retried).
 
 Options are make variables:
 
 ```bash
+make run TO=Spanish                    # translate into Spanish (default English)
 make run NOTES=notes.txt               # names, project terms, glossary
 make cc REPO=path/to/docs              # let Claude look up names and terms there
-make run RECAP=120                     # recap every 2 minutes instead of every minute
+make run RECAP=60                      # recap every minute instead of every 30 s
 make run MODEL=claude-sonnet-5-5       # compare speed vs. quality
 make run EFFORT=high HOST=0.0.0.0      # see Troubleshooting for HOST
 ```
@@ -76,17 +81,17 @@ usage limits, and keeps the whole meeting as context rather than the last 30 lin
 
 ## How capturing works
 
-Meet rewrites captions in place while someone is talking, and Japanese ASR revises
-earlier characters often. `content.js` polls the captions panel every 250 ms and
-commits text when it has settled:
+Meet rewrites captions in place while someone is talking, and speech recognition
+revises earlier words often (especially in Japanese). `content.js` polls the
+captions panel every 250 ms and commits text when it has settled:
 
-- a completed sentence (ending in 。？！ with more text after it) once it's unchanged
+- a completed sentence (ending in 。？！?!. etc. with more text after it) once it's unchanged
   for 1 s, even if the speaker keeps talking. Meet puts a provisional 。 on the end of
   text that is still being spoken, so a mark at the very end doesn't count;
 - everything once the speaker pauses for 1.5 s;
 - as a backstop, after 6 s of speech with no sentence end (holding back the last few
-  still-changing characters). Cutting mid-sentence hurts accuracy since Japanese puts
-  the verb last, so this is deliberately not shorter.
+  still-changing characters). Cutting mid-sentence hurts accuracy (e.g. Japanese puts
+  the verb last), so this is deliberately not shorter.
 
 When the recognizer revises text that was already sent, the revised sentence is
 re-sent and the translator is told to skip duplicates. `translate.py` sends lines

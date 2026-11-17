@@ -1,7 +1,7 @@
-# make run                      start the transcript server + a readable recap every minute (Claude API)
+# make run                      start the transcript server + a readable recap every 30 s (Claude API)
 # make cc                       same, but through Claude Code on your Claude plan
 # make live                     line-by-line live translation instead (add BACKEND=claude-code for your plan)
-# make run NOTES=notes.txt RECAP=120 MODEL=claude-sonnet-5-5
+# make run TO=Spanish NOTES=notes.txt RECAP=120 MODEL=claude-sonnet-5-5
 # make cc REPO=path/to/docs     let the recap look up names and terms in a docs/code folder
 # make server / make translate  run either half on its own (e.g. `make translate RECAP=0` for live next to a recap)
 
@@ -10,19 +10,20 @@ BACKEND    ?= api
 MODEL      ?= claude-opus-5-5
 TRANSCRIPT ?= transcript.txt
 HOST       ?= 127.0.0.1
-# Left empty, these default by mode in translate.py: a recap every 60 s at medium
+# Left empty, these default by mode in translate.py: a recap every 30 s at medium
 # effort into recap.txt, or with RECAP=0, live at low effort into translation.txt.
 RECAP      ?=
 EFFORT     ?=
 OUT        ?=
 NOTES      ?=
+TO         ?=
 REPO       ?=
 
 SERVER_ARGS    := --out $(TRANSCRIPT) --host $(HOST)
 TRANSLATE_ARGS := --backend $(BACKEND) --model $(MODEL) --transcript $(TRANSCRIPT) \
                   $(if $(RECAP),--recap $(RECAP)) $(if $(EFFORT),--effort $(EFFORT)) \
                   $(if $(OUT),--out $(OUT)) $(if $(NOTES),--notes $(NOTES)) \
-                  $(if $(REPO),--repo $(REPO))
+                  $(if $(REPO),--repo $(REPO)) $(if $(TO),--to "$(TO)")
 
 .PHONY: run cc live server translate install clean
 
