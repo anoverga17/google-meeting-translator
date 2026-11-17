@@ -60,9 +60,10 @@ Meet rewrites captions in place while someone is talking, and Japanese ASR revis
 earlier characters often. `content.js` polls the captions panel every 250 ms and
 commits text when it has settled:
 
-- a completed sentence (ending in 。？！) once it's unchanged for 0.3 s, even if the
-  speaker keeps talking;
-- everything once the speaker pauses for 0.8 s;
+- a completed sentence (ending in 。？！ with more text after it) once it's unchanged
+  for 1 s, even if the speaker keeps talking. Meet puts a provisional 。 on the end of
+  text that is still being spoken, so a mark at the very end doesn't count;
+- everything once the speaker pauses for 1.5 s;
 - as a backstop, after 6 s of speech with no sentence end (holding back the last few
   still-changing characters). Cutting mid-sentence hurts accuracy since Japanese puts
   the verb last, so this is deliberately not shorter.

@@ -3,14 +3,14 @@
 //
 // Meet rewrites a caption in place while someone is speaking (and Japanese ASR
 // revises earlier characters a lot), so text is only sent once it has settled:
-//   - completed sentences (ending in 。？！) once unchanged for SENTENCE_MS,
+//   - completed sentences (ending in 。？！ with more text after) once unchanged for SENTENCE_MS,
 //   - the whole caption once unchanged for PAUSE_MS (the speaker paused), or
 //   - after MAX_WAIT_MS with no sentence end, all but the still-changing tail.
 // Cutting mid-sentence hurts translation (Japanese puts the verb last), so the
 // last rule is a backstop, not the normal path.
 const POLL_MS = 250;
-const SENTENCE_MS = 300;
-const PAUSE_MS = 800;
+const SENTENCE_MS = 1000;
+const PAUSE_MS = 1500;
 const MAX_WAIT_MS = 6000;
 const TAIL_CHARS = 12;
 
@@ -29,7 +29,9 @@ let sending = false;
 const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
 // The text up to and including the last sentence-ending mark ('' if none).
-const completed = (text) => (text.match(/.*[。？！?!]/s) || [''])[0];
+// Meet puts a provisional 。 on the end of text that is still being spoken, so
+// only a mark with more text after it counts.
+const completed = (text) => (text.match(/.*[。？！?!](?=\s*\S)/s) || [''])[0];
 
 function readCaptions() {
   const region = document.querySelector(REGION);
