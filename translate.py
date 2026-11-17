@@ -1,4 +1,4 @@
-"""Tails the caption transcript and translates it into another language with Claude.
+"""Tails the caption transcript and translates it into another language with Claude (or Codex).
 
 By default, every 30 seconds the new captions are turned into a readable recap
 (fragments merged, repeats dropped) and appended to recap.txt. With --recap 0, lines
@@ -12,6 +12,7 @@ Usage:
     python translate.py --notes notes.txt                # add glossary / meeting background
     python translate.py --model claude-sonnet-5-5        # compare speed/quality
     python translate.py --backend claude-code            # use your Claude plan instead of an API key
+    python translate.py --backend codex                  # use your ChatGPT plan via the Codex CLI
     python translate.py --to Spanish                     # translate into Spanish instead of English
 """
 
@@ -76,7 +77,7 @@ REPO_NOTE = """\
 Documentation or code for the systems being discussed (names, components, terminology) \
 is in the directory {repo}. Speech recognition often garbles system names, acronyms and technical \
 terms: when the captions mention one you can't confidently identify, search that directory \
-with Grep, Glob and Read to find the right term and understand what is being discussed. \
+(read-only) to find the right term and understand what is being discussed. \
 Keep it to a few targeted lookups per reply. Your reply must contain only the translation \
 in the format above, with nothing about the lookups."""
 
@@ -174,40 +175,82 @@ def claude_code_backend(model: str, effort: str, system: str, repo: str | None =
     return lambda lines: turn(tagged("new_captions", lines))
 
 
+def codex_backend(model: str | None, effort: str, system: str):
+    """Translates through one Codex session, resumed each turn (uses your ChatGPT plan, no API key).
+
+    Like the Claude Code backend, the session keeps the whole meeting as history.
+    Codex runs read-only, so with --repo it can search that directory but not change it.
+    Codex doesn't stream text, so each reply appears whole.
+    """
+    workdir = tempfile.mkdtemp(prefix="meet-translate-")  # outside the project, so no AGENTS.md leaks in
+    instructions = Path(workdir, "instructions.txt")
+    instructions.write_text(system, encoding="utf-8")
+    config = {"model_instructions_file": str(instructions), "model_reasoning_effort": effort,
+              "sandbox_mode": "read-only", **({"model": model} if model else {})}
+    flags = [arg for key, value in config.items() for arg in ("-c", f"{key}={json.dumps(value)}")]
+    thread_id = None
+
+    def turn(content: str):
+        nonlocal thread_id
+        resume = ["resume", thread_id] if thread_id else []
+        proc = subprocess.run(["codex", "exec", "--json", "--skip-git-repo-check", *flags, *resume, content],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", cwd=workdir)
+        reply, error = "", proc.stderr.strip()
+        for event in (json.loads(raw) for raw in proc.stdout.splitlines() if raw.startswith("{")):
+            if event["type"] == "thread.started":
+                thread_id = event["thread_id"]
+            elif event["type"] == "item.completed" and event["item"]["type"] == "agent_message":
+                reply = event["item"]["text"]  # the last message is the reply, after any lookups
+            elif event["type"] in ("turn.failed", "error"):
+                error = event.get("message") or event.get("error", {}).get("message") or error
+        if proc.returncode:
+            raise RuntimeError(error or f"codex exited with code {proc.returncode}")
+        return [reply]
+
+    # Start the session (and check the login and model name) before the first caption.
+    turn("Setup check before the meeting starts. Reply with just: ready")
+    return lambda lines: turn(tagged("new_captions", lines))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--backend", default="api", choices=["api", "claude-code"],
-                        help="api: Claude API with ANTHROPIC_API_KEY; claude-code: your Claude plan via the claude CLI")
+    parser.add_argument("--backend", default="api", choices=["api", "claude-code", "codex"],
+                        help="api: Claude API with ANTHROPIC_API_KEY; claude-code: your Claude plan via the claude "
+                             "CLI; codex: your ChatGPT plan via the codex CLI")
     parser.add_argument("--transcript", default="transcript.txt")
     parser.add_argument("--out", help="default: recap.txt, or translation.txt with --recap 0")
-    parser.add_argument("--model", default="claude-opus-5-5")
+    parser.add_argument("--model", help="default: claude-opus-5-5, or Codex's own default with --backend codex")
     parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"],
-                        help="lower is faster; default: medium for recaps, low for live")
+                        help="lower is faster; default: medium for recaps, low for live (codex tops out at xhigh)")
     parser.add_argument("--to", default="English", metavar="LANGUAGE",
                         help="language to translate into (the captions' language is detected)")
     parser.add_argument("--notes", help="file with meeting background, names, or a glossary")
-    parser.add_argument("--repo", help="your system's repo/docs, searched for system names and terms (claude-code only)")
+    parser.add_argument("--repo", help="your system's repo/docs, searched for system names and terms (not with api)")
     parser.add_argument("--recap", type=float, default=30, metavar="SECONDS",
                         help="write a readable recap every SECONDS (default 30); 0 translates live, line by line")
     args = parser.parse_args()
     args.out = args.out or ("recap.txt" if args.recap else "translation.txt")
     args.effort = args.effort or ("medium" if args.recap else "low")
+    if args.backend != "codex":
+        args.model = args.model or "claude-opus-5-5"
 
     system = (RECAP_PROMPT if args.recap else LIVE_PROMPT).format(target=args.to, noise=NOISE_NOTE)
     if args.notes:
         system += "\n\n" + tagged("meeting_notes", [Path(args.notes).read_text(encoding="utf-8").strip()])
     if args.repo:
-        if args.backend != "claude-code" or not Path(args.repo).is_dir():
-            parser.error("--repo needs --backend claude-code and an existing directory")
-        args.repo = str(Path(args.repo).resolve())  # Claude Code runs from a temp dir
+        if args.backend == "api" or not Path(args.repo).is_dir():
+            parser.error("--repo needs --backend claude-code or codex, and an existing directory")
+        args.repo = str(Path(args.repo).resolve())  # Claude Code and Codex run from a temp dir
         system += "\n\n" + tagged("system_repo", [REPO_NOTE.format(repo=args.repo)])
     if args.backend == "api":
         translate = api_backend(args.model, args.effort, system)
-    else:
+    elif args.backend == "claude-code":
         translate = claude_code_backend(args.model, args.effort, system, args.repo)
+    else:
+        translate = codex_backend(args.model, args.effort, system)
 
     Path(args.transcript).touch()
-    print(f"Watching {args.transcript} -> {args.out} ({args.model})", flush=True)
+    print(f"Watching {args.transcript} -> {args.out} ({args.model or 'Codex default model'})", flush=True)
     with open(args.transcript, encoding="utf-8") as transcript, open(args.out, "a", encoding="utf-8") as out:
         transcript.seek(0, 2)  # only translate what's said from now on
         lines, partial, sent_at = [], "", time.monotonic()

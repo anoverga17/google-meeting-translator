@@ -1,7 +1,8 @@
 # Meet caption translator
 
 Captures Google Meet live captions into a raw transcript file, and translates
-them with Claude into the language of your choice (English by default).
+them with Claude (or OpenAI's models through Codex) into the language of your choice
+(English by default).
 
 ```
 Meet tab ──(content.js)──> background.js ──POST──> server.py ──> transcript.txt
@@ -17,7 +18,7 @@ any other agent (e.g. Claude Code) at `transcript.txt` instead of / alongside
 
 ```bash
 make install                         # creates .venv and installs requirements
-export ANTHROPIC_API_KEY=sk-ant-...  # not needed for `make cc`
+export ANTHROPIC_API_KEY=sk-ant-...  # not needed for `make cc` / `make codex`
 ```
 
 Load the extension in Chrome: `chrome://extensions` → enable **Developer mode** →
@@ -30,6 +31,7 @@ folder to a Windows path and load that.)
 ```bash
 make run     # transcript server + translator via the Claude API
 make cc      # same, but translate through Claude Code on your Claude plan
+make codex   # same, but translate through Codex on your ChatGPT plan (e.g. Pro)
 make live    # line-by-line live translation instead of the recap
 ```
 
@@ -49,7 +51,7 @@ greyed out so you can read the translation first and check them afterwards.
 
 `make live` instead translates each caption line as it arrives, at low effort, into
 `translation.txt`: faster but choppier, since captions arrive in fragments. For
-both at once, run `make translate RECAP=0` (add `BACKEND=claude-code` for your plan)
+both at once, run `make translate RECAP=0` (add `BACKEND=claude-code` or `BACKEND=codex` for your plan)
 in a second terminal next to `make run` / `make cc`.
 
 Then join the Meet, turn on captions (CC) and set the caption language to the
@@ -61,7 +63,7 @@ Options are make variables:
 ```bash
 make run TO=Spanish                    # translate into Spanish (default English)
 make run NOTES=notes.txt               # names, project terms, glossary
-make cc REPO=path/to/docs              # let Claude look up names and terms there
+make cc REPO=path/to/docs              # let Claude (or Codex) look up names and terms there
 make run RECAP=60                      # recap every minute instead of every 30 s
 make run MODEL=claude-sonnet-5-5       # compare speed vs. quality
 make run EFFORT=high HOST=0.0.0.0      # see Troubleshooting for HOST
@@ -69,7 +71,7 @@ make run EFFORT=high HOST=0.0.0.0      # see Troubleshooting for HOST
 
 `make server` / `make translate` run either half on its own (e.g. in two terminals).
 
-`REPO` (Claude Code only) points at a repository or folder describing the systems
+`REPO` (Claude Code or Codex only) points at a repository or folder describing the systems
 being discussed (docs, code, a glossary).
 When the captions mention a system name or technical term Claude can't place
 (speech recognition garbles these a lot), it searches that folder (read-only) to
@@ -78,6 +80,13 @@ find the right term. Each recap takes a few seconds longer.
 `make cc` needs the `claude` CLI installed and logged in. It runs one
 long-running Claude Code session for the whole meeting, counts against your plan's
 usage limits, and keeps the whole meeting as context rather than the last 30 lines.
+
+`make codex` is the same for a ChatGPT plan: install the Codex CLI
+(`npm install -g @openai/codex`) and run `codex login` with your ChatGPT account.
+It uses Codex's default model unless you set `MODEL`, and resumes one Codex session
+per meeting (saved under `~/.codex/sessions` like any other). Codex doesn't stream
+text, so each recap appears whole, and every turn starts the CLI afresh, so it suits
+the recap better than `make live`. Effort tops out at `xhigh`.
 
 ## How capturing works
 

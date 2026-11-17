@@ -1,16 +1,17 @@
 # make run                      start the transcript server + a readable recap every 30 s (Claude API)
 # make cc                       same, but through Claude Code on your Claude plan
+# make codex                    same, but through Codex on your ChatGPT plan
 # make live                     line-by-line live translation instead (add BACKEND=claude-code for your plan)
 # make run TO=Spanish NOTES=notes.txt RECAP=120 MODEL=claude-sonnet-5-5
-# make cc REPO=path/to/docs     let the recap look up names and terms in a docs/code folder
+# make cc REPO=path/to/docs     (or make codex REPO=...) let the recap look up names and terms in a docs/code folder
 # make server / make translate  run either half on its own (e.g. `make translate RECAP=0` for live next to a recap)
 
 PY         := .venv/bin/python
 TRANSCRIPT ?= transcript.txt
 HOST       ?= 127.0.0.1
 # Optional: BACKEND MODEL RECAP EFFORT OUT NOTES TO REPO. Unset, translate.py's defaults
-# apply: the API, Opus, a recap every 30 s at medium effort into recap.txt (or with
-# RECAP=0, live at low effort into translation.txt).
+# apply: the API, Opus (or Codex's own default model), a recap every 30 s at medium effort
+# into recap.txt (or with RECAP=0, live at low effort into translation.txt).
 
 SERVER_ARGS    := --out $(TRANSCRIPT) --host $(HOST)
 TRANSLATE_ARGS := --transcript $(TRANSCRIPT) $(if $(BACKEND),--backend $(BACKEND)) \
@@ -19,7 +20,7 @@ TRANSLATE_ARGS := --transcript $(TRANSCRIPT) $(if $(BACKEND),--backend $(BACKEND
                   $(if $(OUT),--out $(OUT)) $(if $(NOTES),--notes $(NOTES)) \
                   $(if $(REPO),--repo $(REPO)) $(if $(TO),--to "$(TO)")
 
-.PHONY: run cc live server translate install clean
+.PHONY: run cc codex live server translate install clean
 
 # The server logs to server.log so the terminal shows only translations
 # (`tail -f server.log` in another terminal to watch raw captions).
@@ -32,6 +33,9 @@ run: install
 
 cc:
 	@$(MAKE) --no-print-directory run BACKEND=claude-code
+
+codex:
+	@$(MAKE) --no-print-directory run BACKEND=codex
 
 live:
 	@$(MAKE) --no-print-directory run RECAP=0
